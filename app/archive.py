@@ -16,7 +16,13 @@ Integrity model
   version is canonicalized and its digest compared with the manifest.  A
   missing file, malformed JSON/patch or digest mismatch invalidates the whole
   candidate chain; the resolver then tries the next-cheapest chain, reusing
-  only base tables whose digest was already verified.
+  only base tables whose digest was already verified *during the same
+  resolution*.
+* Verification results are never carried across resolutions.  File metadata
+  (mtime/size) is not a trust signal: a base table can be replaced by a
+  same-sized file whose timestamps were restored.  Every resolution therefore
+  re-reads and re-verifies every package it uses, so parsing, averages and
+  downloads always reflect the bytes currently on disk.
 """
 
 from __future__ import annotations
@@ -183,6 +189,21 @@ class _Plan:
     cost: int
 
 
+@dataclass
+class _VerificationCache:
+    """Per-resolution memo of package verification outcomes.
+
+    This lives for exactly one :meth:`Archive.resolve` call: a verified base
+    table may be reused by later candidate chains within that resolution, but
+    never by a later request.  Fresh requests must re-read the files because
+    the mounted archive can change underneath us without any metadata change.
+    """
+
+    verified_bases: dict[tuple[str, str], tuple[Any, int]]
+    failed_bases: dict[tuple[str, str], Issue]
+    failed_patches: dict[tuple[str, str], Issue]
+
+
 def format_bytes(value: int) -> str:
     if value < 1024:
         return f"{value} B"
@@ -217,14 +238,6 @@ class Archive:
         self.manifest_name = manifest_name
         self._manifest: Manifest | None = None
         self._manifest_error: str | None = None
-        # Verified base tables, keyed by (version, package path).  Only fully
-        # verified entries are ever inserted.  The stored stat signature lets
-        # a later call notice that the file changed on disk.
-        self._verified_bases: dict[
-            tuple[str, str], tuple[Any, str, int, tuple[int, int]]
-        ] = {}
-        self._failed_bases: dict[tuple[str, str], Issue] = {}
-        self._failed_patches: dict[tuple[str, str], Issue] = {}
 
     # ------------------------------------------------------------------ manifest
     def load_manifest(self, *, refresh: bool = False) -> Manifest:
@@ -312,11 +325,12 @@ class Archive:
         except ManifestError as exc:
             return Resolution(target=str(target), ok=False, reason=str(exc))
 
-        # Failures are cached only for the duration of one resolution so that
-        # a repaired archive is picked up by the next request.  Verified base
-        # tables remain usable: re-reading them is unnecessary.
-        self._failed_bases.clear()
-        self._failed_patches.clear()
+        # Verification state lasts for this resolution only.  Nothing verified
+        # here is reused by a later request: a same-sized replacement with a
+        # restored mtime would otherwise be served from a stale cache.
+        cache = _VerificationCache(
+            verified_bases={}, failed_bases={}, failed_patches={}
+        )
 
         target = str(target)
         resolution = Resolution(target=target, ok=False)
@@ -333,7 +347,7 @@ class Archive:
                     f" 最后一个问题：{resolution.reason}"
                 )
                 return resolution
-            attempt = self._execute_plan(plan)
+            attempt = self._execute_plan(plan, cache)
             resolution.attempts.append(attempt)
             resolution.issues.extend(attempt.issues)
             if attempt.ok:
@@ -449,16 +463,7 @@ class Archive:
     ) -> str | None:
         return normalize_digest(manifest.digests.get(version, fallback))
 
-    def _stat_signature(self, base: BaseTable) -> tuple[int, int]:
-        """A cheap change detector for cached, already-verified base tables."""
-
-        try:
-            stat = self._package_path(base.package.path).stat()
-        except (OSError, PackageError):
-            return (-1, -1)
-        return (stat.st_mtime_ns, stat.st_size)
-
-    def _execute_plan(self, plan: _Plan) -> Attempt:
+    def _execute_plan(self, plan: _Plan, cache: _VerificationCache) -> Attempt:
         manifest = self._manifest
         assert manifest is not None
         attempt = Attempt(chain=[], ok=False)
@@ -480,24 +485,34 @@ class Archive:
             )
             attempt.reason = f"版本 {base.version} 的底表没有清单摘要，无法核对"
             return attempt
-        if base_key in self._failed_bases:
-            attempt.issues.append(self._failed_bases[base_key])
+        if base_key in cache.failed_bases:
+            attempt.issues.append(cache.failed_bases[base_key])
             attempt.reason = f"底表 {base.package.path} 已确认不可用"
             return attempt
 
-        if base_key in self._verified_bases:
-            document, digest, actual_bytes, signature = self._verified_bases[base_key]
-            if digest != expected_base or self._stat_signature(base) != signature:
-                # The manifest or the file changed under us; force a re-read.
-                del self._verified_bases[base_key]
-                return self._execute_plan(plan)
+        if base_key in cache.verified_bases:
+            # Reuse within this resolution only, so several candidate chains
+            # that start at the same base do not re-read it.  The digest was
+            # proven against the manifest bytes in this same request.
+            document, actual_bytes = cache.verified_bases[base_key]
+            if actual_bytes != base.package.bytes:
+                issue = Issue(
+                    base.package.path,
+                    f"base:{base.version}",
+                    "字节数不符",
+                    f"清单声明 {base.package.bytes} 字节，实际 {actual_bytes} 字节",
+                )
+                cache.failed_bases[base_key] = issue
+                attempt.issues.append(issue)
+                attempt.reason = f"全量底表 {base.package.path} 字节数与清单不符"
+                return attempt
         else:
             try:
                 document, actual_bytes = self.read_base_table(base)
                 digest = document_digest(document)
             except (PackageError, PatchError, CanonicalizationError, ValueError, OSError) as exc:
                 issue = _issue_from_exception(exc, base.package.path, f"base:{base.version}")
-                self._failed_bases[base_key] = issue
+                cache.failed_bases[base_key] = issue
                 attempt.issues.append(issue)
                 attempt.reason = f"全量底表 {base.package.path} 不可用（{issue.kind}）"
                 return attempt
@@ -508,7 +523,7 @@ class Archive:
                     "摘要不符",
                     f"版本 {base.version} 期望 {expected_base}，实际 {digest}",
                 )
-                self._failed_bases[base_key] = issue
+                cache.failed_bases[base_key] = issue
                 attempt.issues.append(issue)
                 attempt.reason = f"全量底表 {base.package.path} 摘要不符"
                 return attempt
@@ -519,16 +534,11 @@ class Archive:
                     "字节数不符",
                     f"清单声明 {base.package.bytes} 字节，实际 {actual_bytes} 字节",
                 )
-                self._failed_bases[base_key] = issue
+                cache.failed_bases[base_key] = issue
                 attempt.issues.append(issue)
                 attempt.reason = f"全量底表 {base.package.path} 字节数与清单不符"
                 return attempt
-            self._verified_bases[base_key] = (
-                document,
-                digest,
-                actual_bytes,
-                self._stat_signature(base),
-            )
+            cache.verified_bases[base_key] = (document, actual_bytes)
 
         base_step = ChainStep(
             kind="base",
@@ -558,8 +568,8 @@ class Archive:
                 attempt.reason = f"版本 {patch.to_version} 缺少清单摘要，无法核对"
                 return attempt
             key = (patch.from_version + "->" + patch.to_version, patch.package.path)
-            if key in self._failed_patches:
-                attempt.issues.append(self._failed_patches[key])
+            if key in cache.failed_patches:
+                attempt.issues.append(cache.failed_patches[key])
                 attempt.reason = f"更正包 {patch.package.path} 已确认不可用"
                 return attempt
             try:
@@ -568,7 +578,7 @@ class Archive:
                 digest = document_digest(patched)
             except (PackageError, PatchError, CanonicalizationError, ValueError, OSError) as exc:
                 issue = _issue_from_exception(exc, patch.package.path, patch.id)
-                self._failed_patches[key] = issue
+                cache.failed_patches[key] = issue
                 attempt.issues.append(issue)
                 attempt.reason = (
                     f"更正包 {patch.package.path} 不可用（{issue.kind}），"
@@ -582,7 +592,7 @@ class Archive:
                     "摘要不符",
                     f"版本 {patch.to_version} 期望 {expected}，实际 {digest}",
                 )
-                self._failed_patches[key] = issue
+                cache.failed_patches[key] = issue
                 attempt.issues.append(issue)
                 attempt.reason = (
                     f"更正包 {patch.package.path} 应用后版本 {patch.to_version} 摘要不符"
@@ -595,7 +605,7 @@ class Archive:
                     "字节数不符",
                     f"清单声明 {patch.package.bytes} 字节，实际 {actual_bytes} 字节",
                 )
-                self._failed_patches[key] = issue
+                cache.failed_patches[key] = issue
                 attempt.issues.append(issue)
                 attempt.reason = (
                     f"更正包 {patch.package.path} 字节数与清单不符"

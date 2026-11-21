@@ -109,5 +109,46 @@ echo "release page: HTTP $code"
 grep -q "摘要不符" "$WORKDIR/body"
 stop_server
 
+echo "== 5. 等字节同时间戳替换底表 → 再次复核不得沿用旧结果 =="
+# Build an intact archive, let the server verify it once, then swap the file
+# on disk (same size, mtime restored) and ask for the same release again.
+SWAP="$WORKDIR/swap"
+cp -r "$ROOT/sample_archive" "$SWAP"
+start_server "$SWAP"
+code="$(status_of "http://127.0.0.1:$PORT/release/2026-06")"
+echo "first release page: HTTP $code"
+[[ "$code" == "200" ]]
+grep -q "目标版已核对通过" "$WORKDIR/body"
+"$PYTHON" "$ROOT/tools/make_broken_archive.py" --apply swap-base "$SWAP" >/dev/null
+code="$(status_of "http://127.0.0.1:$PORT/release/2026-06")"
+echo "second release page: HTTP $code"
+[[ "$code" == "422" ]]
+grep -q "摘要不符" "$WORKDIR/body"
+grep -q "不提供下载" "$WORKDIR/body"
+code="$(status_of "http://127.0.0.1:$PORT/release/2026-06/download")"
+echo "download after swap: HTTP $code"
+[[ "$code" == "422" ]]
+stop_server
+
+echo "== 6. 替换后无可用链 → 拒绝并说明问题包 =="
+# One base table only, verified once, then swapped; no alternative chain exists.
+SINGLE="$WORKDIR/single"
+"$PYTHON" "$ROOT/tools/make_broken_archive.py" single-base "$SINGLE" >/dev/null
+start_server "$SINGLE"
+code="$(status_of "http://127.0.0.1:$PORT/release/2026-07")"
+echo "first release page: HTTP $code"
+[[ "$code" == "200" ]]
+"$PYTHON" "$ROOT/tools/make_broken_archive.py" --apply single-base-swap "$SINGLE" >/dev/null
+code="$(status_of "http://127.0.0.1:$PORT/release/2026-07")"
+echo "second release page: HTTP $code"
+[[ "$code" == "422" ]]
+grep -q "均不可用" "$WORKDIR/body"
+grep -q "摘要不符" "$WORKDIR/body"
+grep -q "tables/table-2026-06.json" "$WORKDIR/body"
+code="$(status_of "http://127.0.0.1:$PORT/release/2026-07/download")"
+echo "download: HTTP $code"
+[[ "$code" == "422" ]]
+stop_server
+
 echo
 echo "all self-checks passed"
